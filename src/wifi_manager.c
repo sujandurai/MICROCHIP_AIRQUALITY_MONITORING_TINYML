@@ -108,3 +108,58 @@ bool WIFI_Connect(const char* ssid, const char* password)
     snprintf(cmd, sizeof(cmd), "AT+CWJAP=\"%s\",\"%s\"\r\n", ssid, password);
     return WIFI_SendCommand(cmd, "WIFI GOT IP", 20000);
 }
+
+// ============================================================
+// WIFI_Passthrough — SERCOM3 (PuTTY) <-> SERCOM5 (ESP-01S)
+// ============================================================
+// Bridges the two UARTs so you can type AT commands directly
+// in PuTTY and see the ESP responses in real time.
+// Prints a banner, then loops forever (reset board to exit).
+// ============================================================
+void WIFI_Passthrough(void)
+{
+    // Print banner to PuTTY
+    const char banner[] =
+        "\r\n"
+        "========================================\r\n"
+        "  ESP-01S AT PASSTHROUGH MODE\r\n"
+        "  PuTTY <-> ESP direct bridge\r\n"
+        "  Type AT commands below:\r\n"
+        "  Try: AT  |  AT+GMR  |  AT+CWLAP\r\n"
+        "  AT+CWJAP=\"sujandurai\",\"12345678\"\r\n"
+        "  Reset board to return to normal mode\r\n"
+        "========================================\r\n\r\n";
+
+    for (const char *p = banner; *p; p++) {
+        while (!(SERCOM3_REGS->USART_INT.SERCOM_INTFLAG & SERCOM_USART_INT_INTFLAG_DRE_Msk));
+        SERCOM3_REGS->USART_INT.SERCOM_DATA = (uint16_t)*p;
+    }
+
+    // Flush any stale bytes from ESP
+    ESP_FlushRx(100);
+
+    // Bridge loop — runs until hardware reset
+    while (1)
+    {
+        // --- PuTTY -> ESP: forward every byte typed in PuTTY to ESP ---
+        if (SERCOM3_REGS->USART_INT.SERCOM_INTFLAG & SERCOM_USART_INT_INTFLAG_RXC_Msk) {
+            uint16_t c = SERCOM3_REGS->USART_INT.SERCOM_DATA;
+
+            // Echo typed char back to PuTTY so you can see it
+            while (!(SERCOM3_REGS->USART_INT.SERCOM_INTFLAG & SERCOM_USART_INT_INTFLAG_DRE_Msk));
+            SERCOM3_REGS->USART_INT.SERCOM_DATA = c;
+
+            // Forward to ESP
+            while (!(SERCOM5_REGS->USART_INT.SERCOM_INTFLAG & SERCOM_USART_INT_INTFLAG_DRE_Msk));
+            SERCOM5_REGS->USART_INT.SERCOM_DATA = c;
+        }
+
+        // --- ESP -> PuTTY: print every byte the ESP sends back ---
+        if (SERCOM5_REGS->USART_INT.SERCOM_INTFLAG & SERCOM_USART_INT_INTFLAG_RXC_Msk) {
+            uint16_t c = SERCOM5_REGS->USART_INT.SERCOM_DATA;
+            while (!(SERCOM3_REGS->USART_INT.SERCOM_INTFLAG & SERCOM_USART_INT_INTFLAG_DRE_Msk));
+            SERCOM3_REGS->USART_INT.SERCOM_DATA = c;
+        }
+    }
+}
+

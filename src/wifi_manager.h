@@ -45,4 +45,11 @@ bool WIFI_SetMode(uint8_t mode);
  */
 bool WIFI_Connect(const char* ssid, const char* password);
 
+/**
+ * @brief Transparent AT passthrough: bridges SERCOM3 (PuTTY) <-> SERCOM5 (ESP).
+ *        Lets you type AT commands directly in PuTTY to test the ESP module.
+ *        Press the PA17 button OR reset the board to exit and boot normally.
+ */
+void WIFI_Passthrough(void);
+
 #endif // WIFI_MANAGER_H

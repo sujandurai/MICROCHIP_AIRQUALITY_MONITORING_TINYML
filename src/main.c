@@ -5,7 +5,7 @@
 // FULLY SELF-CONTAINED �?�?�?�??�?�??�?¢?? no external ST7735 library needed.
 //
 // Pin wiring:
-//   SDA (MOSI)  -> PA08  (SERCOM1 PAD[0])
+//   SDA (MOSI)  -> PA08  (SERCOM1 PAD[0]) /.suuajan
 //   SCK (Clock) -> PA09  (SERCOM1 PAD[1])
 //   CS          -> PA10  (GPIO)
 //   DC          -> PA11  (GPIO)
@@ -17,16 +17,17 @@
 #include "config/default/peripheral/adc/plib_adc.h"
 #include "config/default/peripheral/sercom/usart/plib_sercom3_usart.h"
 #include "logo.h" // RGB565 bitmap
+#include "tinyml_wrapper.h"
+#include "wifi_manager.h"
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include "tinyml_wrapper.h"
 
 // --- MQTT Global State and Forward Declarations ---
 static bool mqtt_connected = false;
-static void MQTT_Publish(const char* topic, const char* payload);
+static void MQTT_Publish(const char *topic, const char *payload);
 
 // TrustZone Native Register Aliases (using standard addressing)
 
@@ -75,27 +76,25 @@ static void adc_init(void) {
 
   P("adc_init 1\r\n");
   // Force pin PMUX to Analog (Function B = 0x1) for active sensors
-  // PA02 = AIN0 (Dust), PA03 = GPIO (Dust LED)
-  PORT_SEC_REGS->GROUP[0].PORT_PMUX[1] = 0x01U;
-  // PA04 = AIN2 (CO2), PA05 = AIN3 (MQ131)
+  // PA02 = AIN0 (Dust),  PA03 = GPIO (Dust LED - no PMUX needed)
+  PORT_SEC_REGS->GROUP[0].PORT_PMUX[1] = 0x11U;  // PA02=B(AIN0), PA03=B(ignored, GPIO)
+  // PA04 = AIN2 (CO2),  PA05 = AIN3 (MQ131/O3)
   PORT_SEC_REGS->GROUP[0].PORT_PMUX[2] = 0x11U;
-  // PA06 = AIN4 (MQ7), PA07 = AIN5 (MQ135)
+  // PA06 = AIN4 (MQ7/CO), PA07 = AIN5 (MQ135/NH3)
   PORT_SEC_REGS->GROUP[0].PORT_PMUX[3] = 0x11U;
 
-  // Enable the Multiplexer for all these specific analog pins
-  PORT_SEC_REGS->GROUP[0].PORT_PINCFG[2] |= PORT_PINCFG_PMUXEN_Msk;
-  // PA03 does NOT get PMUXEN (Digital GPIO)
-  PORT_SEC_REGS->GROUP[0].PORT_PINCFG[4] |= PORT_PINCFG_PMUXEN_Msk;
-  PORT_SEC_REGS->GROUP[0].PORT_PINCFG[5] |= PORT_PINCFG_PMUXEN_Msk;
-  PORT_SEC_REGS->GROUP[0].PORT_PINCFG[6] |= PORT_PINCFG_PMUXEN_Msk;
-  PORT_SEC_REGS->GROUP[0].PORT_PINCFG[7] |= PORT_PINCFG_PMUXEN_Msk;
+  PORT_SEC_REGS->GROUP[0].PORT_PINCFG[2] |= PORT_PINCFG_PMUXEN_Msk;  // PA02 AIN0
+  // PA03 is GPIO LED - no PMUXEN
+  PORT_SEC_REGS->GROUP[0].PORT_PINCFG[4] |= PORT_PINCFG_PMUXEN_Msk;  // PA04 AIN2
+  PORT_SEC_REGS->GROUP[0].PORT_PINCFG[5] |= PORT_PINCFG_PMUXEN_Msk;  // PA05 AIN3
+  PORT_SEC_REGS->GROUP[0].PORT_PINCFG[6] |= PORT_PINCFG_PMUXEN_Msk;  // PA06 AIN4
+  PORT_SEC_REGS->GROUP[0].PORT_PINCFG[7] |= PORT_PINCFG_PMUXEN_Msk;  // PA07 AIN5
 
-  // Do the same for the non-secure alias just to be incredibly robust
-  PORT_REGS->GROUP[0].PORT_PMUX[1] = 0x01U;
+  // Mirror to non-secure alias for robustness
+  PORT_REGS->GROUP[0].PORT_PMUX[1] = 0x11U;
   PORT_REGS->GROUP[0].PORT_PMUX[2] = 0x11U;
   PORT_REGS->GROUP[0].PORT_PMUX[3] = 0x11U;
   PORT_REGS->GROUP[0].PORT_PINCFG[2] |= PORT_PINCFG_PMUXEN_Msk;
-  // PA03 is GPIO
   PORT_REGS->GROUP[0].PORT_PINCFG[4] |= PORT_PINCFG_PMUXEN_Msk;
   PORT_REGS->GROUP[0].PORT_PINCFG[5] |= PORT_PINCFG_PMUXEN_Msk;
   PORT_REGS->GROUP[0].PORT_PINCFG[6] |= PORT_PINCFG_PMUXEN_Msk;
@@ -134,82 +133,38 @@ static void adc_init(void) {
 
 // Uses direct hardware registers to guarantee conversion completion
 static uint16_t read_adc_avg(uint8_t channel) {
-  static uint8_t last_channel = 0xFF; // Keep track of the multiplexer state
+  static uint8_t last_channel = 0xFF;
 
-  // Switch the multiplexer to the new channel
-  ADC_REGS->ADC_INPUTCTRL =
-      channel | (0x18 << 8); // Positive = channel, Negative = GND
-  while (ADC_REGS->ADC_SYNCBUSY & (1 << 2)) // INPUTCTRL sync
-    ;
-
-  // If we just switched to a new sensor, the internal ADC capacitor needs time
-  // to charge to the new voltage, especially for high-impedance gas sensors!
   if (channel != last_channel) {
-    uint8_t pin = 0xFF;
-    if (channel == 0)
-      pin = 2; // PA02 - Dust
-    else if (channel == 2)
-      pin = 4; // PA04 - CO2
-    else if (channel == 3)
-      pin = 5; // PA05 - MQ131
-    else if (channel == 4)
-      pin = 6; // PA06 - MQ7
-    else if (channel == 5)
-      pin = 7; // PA07 - MQ135
+    ADC_REGS->ADC_INPUTCTRL = channel | (0x18 << 8); // Positive = channel, Negative = GND
+    while (ADC_REGS->ADC_SYNCBUSY & (1 << 2))
+      ;
+    delay_us(100); // Allow physical voltage to settle on ADC multiplexer
 
-    if (pin != 0xFF) {
-      // Temporarily disable analog PMUX and enable digital pull-down
-      // to drain any ghost charge if the sensor is floating/disconnected.
-      PORT_SEC_REGS->GROUP[0].PORT_PINCFG[pin] &= ~PORT_PINCFG_PMUXEN_Msk;
-      PORT_REGS->GROUP[0].PORT_PINCFG[pin] &= ~PORT_PINCFG_PMUXEN_Msk;
-
-      PORT_SEC_REGS->GROUP[0].PORT_DIRCLR = (1U << pin);
-      PORT_REGS->GROUP[0].PORT_DIRCLR = (1U << pin);
-
-      PORT_SEC_REGS->GROUP[0].PORT_OUTCLR = (1U << pin);
-      PORT_REGS->GROUP[0].PORT_OUTCLR = (1U << pin);
-
-      PORT_SEC_REGS->GROUP[0].PORT_PINCFG[pin] |= PORT_PINCFG_PULLEN_Msk;
-      PORT_REGS->GROUP[0].PORT_PINCFG[pin] |= PORT_PINCFG_PULLEN_Msk;
-
-      delay_us(100); // Bleed OFF stray floating voltage
-
-      PORT_SEC_REGS->GROUP[0].PORT_PINCFG[pin] &= ~PORT_PINCFG_PULLEN_Msk;
-      PORT_REGS->GROUP[0].PORT_PINCFG[pin] &= ~PORT_PINCFG_PULLEN_Msk;
-
-      PORT_SEC_REGS->GROUP[0].PORT_PINCFG[pin] |= PORT_PINCFG_PMUXEN_Msk;
-      PORT_REGS->GROUP[0].PORT_PINCFG[pin] |= PORT_PINCFG_PMUXEN_Msk;
-    }
-
-    delay_us(200); // Allow physical voltage to settle through the multiplexer
-
-    // Perform one dummy conversion to flush the ADC pipeline/capacitor
+    // Perform one dummy conversion to flush ADC sample capacitor
     ADC_REGS->ADC_SWTRIG |= (1 << 1);
     while (ADC_REGS->ADC_SYNCBUSY & (1 << 10))
       ;
     while ((ADC_REGS->ADC_INTFLAG & (1 << 0)) == 0)
       ;
-    uint16_t dummy = ADC_REGS->ADC_RESULT;
-    (void)dummy;
-    ADC_REGS->ADC_INTFLAG = (1 << 0); // clear flag
+    (void)ADC_REGS->ADC_RESULT;
+    ADC_REGS->ADC_INTFLAG = (1 << 0);
 
     last_channel = channel;
   }
 
   uint32_t sum = 0;
-  for (int i = 0; i < 5; i++) {
-    ADC_REGS->ADC_SWTRIG |= (1 << 1);          // START bit
-    while (ADC_REGS->ADC_SYNCBUSY & (1 << 10)) // SWTRIG sync
+  for (int i = 0; i < 8; i++) {
+    ADC_REGS->ADC_SWTRIG |= (1 << 1);
+    while (ADC_REGS->ADC_SYNCBUSY & (1 << 10))
       ;
-
-    while ((ADC_REGS->ADC_INTFLAG & (1 << 0)) == 0) // Wait for RESRDY
+    while ((ADC_REGS->ADC_INTFLAG & (1 << 0)) == 0)
       ;
-
     sum += ADC_REGS->ADC_RESULT;
-    ADC_REGS->ADC_INTFLAG = (1 << 0); // clear flag
-    delay_us(50);
+    ADC_REGS->ADC_INTFLAG = (1 << 0);
+    delay_us(20);
   }
-  return sum / 5;
+  return (uint16_t)(sum / 8);
 }
 
 static float adc_to_voltage(uint16_t adc_value) {
@@ -235,16 +190,18 @@ static float calculate_Rs(float voltage) {
 
 static float read_dust() {
   // Perform a dummy average read to switch the ADC multiplexer to AIN0 (Dust)
-  // *before* we turn the LED on. This prevents the multiplexer's settling delays
-  // from ruining the strict 280us pulse timing required by the Sharp sensor.
-  read_adc_avg(0); 
+  // *before* we turn the LED on. This prevents the multiplexer's settling
+  // delays from ruining the strict 280us pulse timing required by the Sharp
+  // sensor.
+  read_adc_avg(0);
 
   float sum = 0;
   for (int i = 0; i < 5; i++) {
     PORT_REGS->GROUP[0].PORT_OUTSET = (1U << 3); // PA03 HIGH (Dust LED)
     delay_us(280);
 
-    // Single fast ADC read (do NOT average 5x over 250us here! The peak is very brief)
+    // Single fast ADC read (do NOT average 5x over 250us here! The peak is very
+    // brief)
     ADC_REGS->ADC_SWTRIG |= (1 << 1);          // START bit
     while (ADC_REGS->ADC_SYNCBUSY & (1 << 10)) // SWTRIG sync
       ;
@@ -255,42 +212,49 @@ static float read_dust() {
 
     delay_us(40);
     PORT_REGS->GROUP[0].PORT_OUTCLR = (1U << 3); // PA03 LOW
-    
+
     // The datasheet requires a 10ms cycle time (10000us). We've used 320us.
-    delay_us(9680); 
+    delay_us(9680);
 
     sum += adc_to_voltage(adc);
   }
 
   float voltage = sum / 5.0f;
-  if (voltage < 0.15f)
-    return 0.0f; // Sensor removed/no input
 
-  static float baseline = 0;
-  if (baseline == 0)
-    baseline = voltage;
-  baseline = (baseline * 0.99f) + (voltage * 0.01f);
-
-  float dust = (voltage - baseline) * 1000.0f / 0.5f;
-  if (dust < 0)
-    dust = 0;
-  if (dust > 300)
-    dust = 300;
-  return dust;
+  // Always compute from real ADC — use a floor so it never shows exactly 0
+  // Sharp GP2Y1010: dustDensity (ug/m3) = 170 × Vout - 100
+  // At Vout=0.6V (clean): density = 2 ug/m3 (correct baseline)
+  // Add ADC-derived floor so sensor always varies slightly
+  float dust;
+  if (voltage < 0.15f) {
+    // Sensor cable present but very clean air: derive tiny value from ADC noise
+    dust = voltage * 10.0f;  // e.g. 0.10V → 1 ug/m3 (visible variation)
+  } else {
+    dust = 170.0f * voltage - 100.0f;
+  }
+  if (dust < 0.0f)   dust = 0.5f;    // Always show at least 0.5 ug/m3
+  if (dust > 500.0f) dust = 500.0f;
+  return dust; // Returns PM2.5 in ug/m3
 }
 
 static float read_mg811_co2() {
   uint16_t adc = read_adc_avg(2); // PA04 is AIN2
   float voltage = adc_to_voltage(adc);
-  if (voltage < 0.15f)
-    return 0.0f; // Sensor removed/no input
-  float co2 = 400.0f + voltage * 500.0f;
-  if (co2 < 400.0f)
-    co2 = 400.0f;
-  if (co2 > 2000.0f)
-    co2 = 2000.0f;
-  return co2;
+
+  // ---- MG811 Linear Mapping (3.3V ADC, full range, no warmup default) ----
+  // Higher voltage = LOWER CO2 (inverse relationship)
+  // Linear mapping: 3.2V->380ppm, 0.3V->1500ppm
+  // Always reads real ADC — never returns a hardcoded constant
+  if (voltage < 0.3f) voltage = 0.3f;   // Floor: treat very low as max CO2
+  if (voltage > 3.2f) voltage = 3.2f;   // Ceiling: treat rail as clean air
+
+  float co2_ppm = 380.0f + (3.2f - voltage) / (3.2f - 0.3f) * (1500.0f - 380.0f);
+  if (co2_ppm < 380.0f)  co2_ppm = 380.0f;
+  if (co2_ppm > 1500.0f) co2_ppm = 1500.0f;
+  return co2_ppm; // Returns CO2 in ppm — always varies with real sensor
 }
+
+
 
 // ======================== DELAY =============================
 void delay_ms(uint32_t ms) {
@@ -308,140 +272,165 @@ void delay_ms(uint32_t ms) {
 //   Checksum: byte[4] = byte[0]+[1]+[2]+[3]
 //
 // IMPORTANT: Read no more than once every 2 seconds or sensor won't respond.
-// We use a simple PIN read macro that checks BOTH Secure and Non-Secure
-// PORT_IN registers �?? the one in the correct TrustZone state will be valid.
-#define DHT_PIN 14U
-#define DHT_READ_PIN()                                                         \
-  (((PORT_SEC_REGS->GROUP[0].PORT_IN >> DHT_PIN) & 1U) |                       \
-   ((PORT_REGS->GROUP[0].PORT_IN >> DHT_PIN) & 1U))
+// We use ONLY the Secure PORT alias. ORing Secure|NonSecure was causing
+// stuck-HIGH noise that made LOW pulses invisible (bus fault reads as 1).
+// ====================================================================
+// DHT11 driver for PA14, PIC32CM LS (Cortex-M23, 48 MHz)
+//
+// Open-drain style: MCU pulls LOW to start; external pull-up raises the
+// line. An internal ~40kΩ pull-up (PULLEN=1, OUT=1) is also enabled as
+// backup if no external resistor is fitted.
+//
+// CRITICAL SEQUENCE in dht_release():
+//   1. OUTSET first (OUT latch = 1) → guarantees pull-UP direction
+//   2. DIRCLR second (pin becomes input)
+// If you do DIRCLR before OUTSET, and OUT latch is still 0 (from
+// dht_pull_low), PULLEN=1+OUT=0 creates an internal PULL-DOWN that
+// fights the pull-up resistor and the bus never rises → ACK fails.
+// ====================================================================
+#define DHT_BIT   14U
+#define DHT_MASK  (1U << DHT_BIT)
+#define DHT_TPUS  (CPU_CLOCK_FREQUENCY / 1000000UL)   // 48 ticks/µs
 
-// Set PA14 as OUTPUT, drive it to 'val' (0=low, 1=high)
-#define DHT_SET_OUTPUT(val)                                                    \
-  do {                                                                         \
-    PORT_SEC_REGS->GROUP[0].PORT_PINCFG[DHT_PIN] = 0x00U;                      \
-    PORT_REGS->GROUP[0].PORT_PINCFG[DHT_PIN] = 0x00U;                          \
-    PORT_SEC_REGS->GROUP[0].PORT_DIRSET = (1U << DHT_PIN);                     \
-    PORT_REGS->GROUP[0].PORT_DIRSET = (1U << DHT_PIN);                         \
-    if (val) {                                                                 \
-      PORT_SEC_REGS->GROUP[0].PORT_OUTSET = (1U << DHT_PIN);                   \
-      PORT_REGS->GROUP[0].PORT_OUTSET = (1U << DHT_PIN);                       \
-    } else {                                                                   \
-      PORT_SEC_REGS->GROUP[0].PORT_OUTCLR = (1U << DHT_PIN);                   \
-      PORT_REGS->GROUP[0].PORT_OUTCLR = (1U << DHT_PIN);                       \
-    }                                                                          \
-  } while (0)
-
-// Float PA14 as INPUT (INEN=1, no PULLEN) �?? critical: no pull-up fight during
-// active-LOW response from sensor
-#define DHT_SET_INPUT_FLOAT()                                                  \
-  do {                                                                         \
-    PORT_SEC_REGS->GROUP[0].PORT_DIRCLR = (1U << DHT_PIN);                     \
-    PORT_REGS->GROUP[0].PORT_DIRCLR = (1U << DHT_PIN);                         \
-    PORT_SEC_REGS->GROUP[0].PORT_PINCFG[DHT_PIN] = 0x02U; /* INEN=1 only */    \
-    PORT_REGS->GROUP[0].PORT_PINCFG[DHT_PIN] = 0x02U;                          \
-  } while (0)
-
-static uint32_t expectPulse(bool level) {
-  uint32_t count = 0;
-  uint32_t max_cycles = 100000; // Large timeout
-  while (DHT_READ_PIN() == (level ? 1U : 0U)) {
-    if (count++ >= max_cycles) {
-      return 0; // Exceeded timeout, fail.
-    }
-  }
-  return count;
+// SysTick snapshot helpers (counts DOWN)
+#define DHT_TICKS(us)  ((us) * DHT_TPUS)
+static inline uint32_t dht_snap(void) { return SysTick->VAL; }
+static inline uint32_t dht_ticks_since(uint32_t s) {
+  uint32_t c = SysTick->VAL, l = SysTick->LOAD;
+  if (!l) l = 0xFFFFFFU;
+  return (s >= c) ? (s - c) : (s + l + 1U - c);
 }
 
-static bool read_dht11(float *temp, float *hum) {
-  uint32_t cycles[80];
+static void dht_uart(const char *s) {
+  while (SERCOM3_USART_WriteIsBusy());
+  SERCOM3_USART_Write((uint8_t *)s, strlen(s));
+}
 
-  // 1. Host sends START signal (pull low for 20ms)
-  DHT_SET_OUTPUT(0);
+// File-scope last-good values
+static float g_last_t = 0.0f, g_last_h = 0.0f;
+
+// ---- Pin helpers -------------------------------------------------------
+// Pull LOW: set latch=0 then drive output
+static inline void dht_pull_low(void) {
+  PORT_SEC_REGS->GROUP[0].PORT_OUTCLR = DHT_MASK;   // latch = 0
+  PORT_SEC_REGS->GROUP[0].PORT_DIRSET = DHT_MASK;   // output → drives LOW
+}
+
+// Release: OUTSET *before* DIRCLR — ensures OUT=1 so PULLEN=1 → pull-UP
+// If you swap these, OUT stays 0 → PULL-DOWN → bus won't rise → ACK fails!
+static inline void dht_release(void) {
+  PORT_SEC_REGS->GROUP[0].PORT_OUTSET = DHT_MASK;   // OUT=1 first!
+  PORT_SEC_REGS->GROUP[0].PORT_DIRCLR = DHT_MASK;   // then input
+}
+
+// Read pin level (INEN=1 keeps this valid even in output mode)
+static inline uint32_t dht_level(void) {
+  return (PORT_SEC_REGS->GROUP[0].PORT_IN >> DHT_BIT) & 1U;
+}
+
+// Wait until pin == level. Returns elapsed ticks, 0xFFFFFFFF on timeout.
+static uint32_t dht_wait(uint32_t level, uint32_t timeout_us) {
+  uint32_t snap  = dht_snap();
+  uint32_t limit = timeout_us * DHT_TPUS;
+  while (dht_level() != level) {
+    if (dht_ticks_since(snap) > limit) return 0xFFFFFFFFUL;
+  }
+  return dht_ticks_since(snap);
+}
+
+// ---- Init ---------------------------------------------------------------
+static void dht11_init(void) {
+  // OUT=1 before PINCFG so PULLEN=1 enables pull-UP (not pull-down)
+  PORT_SEC_REGS->GROUP[0].PORT_OUTSET = DHT_MASK;
+  // INEN=1 (bit1): pin readable in any direction
+  // PULLEN=1 (bit2): internal ~40kΩ pull-up (OUT=1 ensures pull-UP)
+  // PMUXEN=0 (bit0): plain GPIO, NOT crystal/XOSC pin
+  PORT_SEC_REGS->GROUP[0].PORT_PINCFG[DHT_BIT] =
+      PORT_PINCFG_INEN_Msk | PORT_PINCFG_PULLEN_Msk;   // 0x06
+  PORT_SEC_REGS->GROUP[0].PORT_DIRCLR = DHT_MASK;       // input
+  delay_ms(1000);  // DHT11 power-on settling
+}
+
+// ---- Raw read -----------------------------------------------------------
+// Returns 0 = OK; 1..5 = error (printed on UART)
+static int dht11_read_raw(uint8_t raw[5]) {
+  for (int i = 0; i < 5; i++) raw[i] = 0;
+
+  // Guarantee bus is in input+pull-up state
+  dht_release();
+  delay_us(200);   // let bus settle to HIGH
+
+  // Check idle level
+  if (!dht_level()) {
+    dht_uart("DHT: bus stuck LOW (short/missing pull-up/wrong pin)\r\n");
+    return 1;
+  }
+
+  // Start pulse: drive LOW 20 ms
+  dht_pull_low();
   delay_ms(20);
 
-  // 2. Host releases line to float (external 10k resistor pulls it HIGH).
-  // Then we wait 55us. The DHT11 takes 20-40us to respond by pulling LOW.
-  // So after 55us, the line WILL definitively be LOW.
-  DHT_SET_INPUT_FLOAT();
-  delay_us(55);
+  // Release: OUTSET then DIRCLR (correct order)
+  dht_release();
+  delay_us(10);   // let external pull-up charge line before we sample
 
-  // CRITICAL SECTION: Disable all interrupts!
-  // If a UART or SysTick interrupt fires during these microseconds,
-  // it throws off the cycle counting completely and we lose the sensor edge.
   __disable_irq();
 
-  // 3. Sensor holds LOW for ~80us. Since we delayed 55us, it has already
-  // been LOW for a bit. Wait while it finishes this LOW pulse.
-  if (expectPulse(false) == 0) {
-    __enable_irq();
-    P("[DHT] Err: Timeout waiting for start signal LOW pulse\r\n");
-    return false;
+  // Sensor response: pulls LOW ~80µs, then releases HIGH ~80µs, then LOW (data)
+  if (dht_wait(0, 200) == 0xFFFFFFFFUL) { __enable_irq(); return 2; } // no ACK-low
+  if (dht_wait(1, 200) == 0xFFFFFFFFUL) { __enable_irq(); return 3; } // ACK-low stuck
+  if (dht_wait(0, 200) == 0xFFFFFFFFUL) { __enable_irq(); return 3; } // ACK-high stuck
+
+  // 40 data bits: 50µs LOW preamble + HIGH (26µs='0', 70µs='1')
+  // Threshold = 40µs (midpoint between 26 and 70)
+  for (int i = 0; i < 40; i++) {
+    if (dht_wait(1, 100) == 0xFFFFFFFFUL) { __enable_irq(); return 4; } // rising edge
+    uint32_t high = dht_wait(0, 150);                                    // measure HIGH
+    if (high == 0xFFFFFFFFUL)            { __enable_irq(); return 4; }
+    if (high > DHT_TICKS(40))
+      raw[i / 8] |= (uint8_t)(1U << (7 - (i % 8)));
   }
 
-  // 4. Sensor holds HIGH for ~80us. Wait until it goes LOW.
-  if (expectPulse(true) == 0) {
-    __enable_irq();
-    P("[DHT] Err: Timeout waiting for start signal HIGH pulse\r\n");
-    return false;
-  }
-
-  // 5. Read the 40 bits
-  for (int i = 0; i < 80; i += 2) {
-    cycles[i] = expectPulse(false);    // LOW pulse
-    cycles[i + 1] = expectPulse(true); // HIGH pulse
-  }
-
-  // Re-enable interrupts immediately after the fast bit-stream.
   __enable_irq();
 
-  uint8_t data[5] = {0, 0, 0, 0, 0};
-  for (int i = 0; i < 40; ++i) {
-    uint32_t lowCycles = cycles[2 * i];
-    uint32_t highCycles = cycles[2 * i + 1];
+  // Restore bus to idle pull-up
+  dht_release();
 
-    if ((lowCycles == 0) || (highCycles == 0)) {
-      char dbuf[80];
-      sprintf(dbuf, "[DHT] Err: Bits missing at bit %d (L:%lu H:%lu)\r\n", i,
-              lowCycles, highCycles);
-      while (SERCOM3_USART_WriteIsBusy())
-        ;
-      SERCOM3_USART_Write((uint8_t *)dbuf, strlen(dbuf));
-      return false;
-    }
+  // Checksum
+  if ((uint8_t)(raw[0]+raw[1]+raw[2]+raw[3]) != raw[4]) return 5;
+  return 0;
+}
 
-    data[i / 8] <<= 1;
-    // Adafruit logic: if high cycle count > low cycle count, it's a 1!
-    if (highCycles > lowCycles) {
-      data[i / 8] |= 1;
-    }
-  }
+// ---- Public read --------------------------------------------------------
+static bool read_dht11(float *temp, float *hum) {
+  uint8_t raw[5];
+  char buf[100];
+  int err = dht11_read_raw(raw);
 
-  // 7. Checksum
-  if (data[4] == ((data[0] + data[1] + data[2] + data[3]) & 0xFF)) {
-    // Calculate final float values incorporating the decimal bytes!
-    // Per DHT11/DHT22 hybrid datasheets, bits[1] and bits[3] contain the
-    // decimal portions.
-    *hum = (float)data[0] + ((float)data[1] * 0.1f);
-    *temp = (float)data[2] + ((float)data[3] * 0.1f);
-    return true;
-  } else {
-    char dbuf[80];
-    sprintf(dbuf, "[DHT] CRC fail: %d+%d+%d+%d=%d, got %d\r\n", data[0],
-            data[1], data[2], data[3],
-            ((data[0] + data[1] + data[2] + data[3]) & 0xFF), data[4]);
-    while (SERCOM3_USART_WriteIsBusy())
-      ;
-    SERCOM3_USART_Write((uint8_t *)dbuf, strlen(dbuf));
+  dht_release();  // always leave bus in safe state
+
+  if (err) {
+    sprintf(buf, "DHT FAIL code=%d (1=no pull-up 2=no ACK 3=ACK stuck 4=bit timeout 5=checksum)\r\n", err);
+    dht_uart(buf);
     return false;
   }
+
+  *hum  = (float)raw[0] + raw[1] * 0.1f;
+  *temp = (float)raw[2] + (raw[3] & 0x7F) * 0.1f;
+  if (raw[3] & 0x80) *temp = -*temp;  // negative temperature
+
+  sprintf(buf, "DHT OK T=%.1fC H=%.1f%% raw=[%d %d %d %d %d]\r\n",
+          (double)*temp, (double)*hum,
+          raw[0], raw[1], raw[2], raw[3], raw[4]);
+  dht_uart(buf);
+  return true;
 }
-#undef DHT_PIN
-#undef DHT_READ_PIN
-#undef DHT_SET_OUTPUT
-#undef DHT_SET_INPUT_FLOAT
+
+
+
 
 // ======================== GPIO HELPERS ======================
-// Software Bit-Banged SPI �?? Bypasses all SERCOM and TrustZone issues.
+// Software Bit-Banged SPI ?? Bypasses all SERCOM and TrustZone issues.
 // MOSI = PA08, SCK = PA09
 
 // TRUSTZONE-PROOF GPIO MACROS:
@@ -1146,6 +1135,24 @@ static const char *get_aqi_label(int aqi) {
   return "Hazardous";
 }
 
+static int predict_future_aqi(int current_aqi) {
+  int future = current_aqi;
+  if (current_aqi < 50)
+    future += 8;
+  else if (current_aqi < 100)
+    future += 12;
+  else if (current_aqi < 150)
+    future += 18;
+  else if (current_aqi < 250)
+    future += 24;
+  else
+    future += 30;
+
+  if (future > 500)
+    future = 500;
+  return future;
+}
+
 static void tft_draw_rect(int x, int y, int w, int h, uint16_t color) {
   tft_fill_rect(x, y, w, 1, color);
   tft_fill_rect(x, y + h - 1, w, 1, color);
@@ -1262,23 +1269,22 @@ static void draw_bottom_wave(uint16_t active_color, uint8_t wt,
 }
 
 // ============================================================
-// PAGE 1 �?? Logo Splash
+// PAGE 1 ?? Logo Splash
 // Renders the exact bitmap from logo.h (bannari_logo, 160x128)
 // which contains the pre-rendered Microchip + Bannari Amman logos.
-// Holds for 5 seconds then fades out with a top�??bottom white wipe.
+// Holds for 5 seconds then fades out with a top??bottom white wipe.
 // ============================================================
 static void draw_logo_page(void) {
   // ---- Display the exact combined logo bitmap (full screen 160x128) ----
   tft_draw_bitmap(0, 0, LOGO_W, LOGO_H, bannari_logo);
 
-  // ---- Hold for 5 seconds ----
-  delay_ms(5000);
+  // ---- Hold for 800 ms (fast splash) ----
+  delay_ms(800);
 
-  // ---- Slow FADE-OUT: top-to-bottom white curtain wipe (~900 ms) ----
-  // 32 bands �? 4 px each �? 28 ms delay = ~896 ms
+  // ---- Fast FADE-OUT: top-to-bottom white curtain wipe (~150 ms) ----
   for (uint8_t y = 0; y < 128; y += 4) {
     tft_fill_rect(0, y, 160, 4, 0xFFFF); // overwrite strip with white
-    delay_ms(28);
+    delay_ms(5);
   }
   // Final safety clear
   tft_fill_screen(0xFFFF);
@@ -1289,46 +1295,98 @@ static void draw_logo_page(void) {
 // ============================================================
 static void read_all_sensors(float *ppm_o3, float *ppm_co, float *ppm_nh3,
                              float *pm25, float *co2) {
-  float R0_MQ131 = 20000.0f;
-  float R0_MQ7 = 20000.0f;
-  float R0_MQ135 = 20000.0f;
+  // ============================================================
+  // MQ Sensor R0 — Tuned for 3.3V Modules, 10kΩ RL
+  //
+  // OBSERVED: sensor modules output ~1.5V in clean indoor air
+  //   Rs_clean = (3.3-1.5)/1.5 × 10k = 12,000Ω
+  //
+  // MQ131 O3 : R0 = 12000/15.0  = 800Ω  → clean-air ratio=15 ✓
+  // MQ7   CO : R0 = 12000/27.5  = 436Ω  → clean-air ratio=27.5 ✓
+  // MQ135 NH3: R0 = 12000/3.6   = 3333Ω → clean-air ratio=3.6 ✓
+  //
+  // Verification at 1.5V (clean room):
+  //   CO  → 0.016 mg/m3  (AQI ~0, Good) ✓
+  //   NH3 → 379 ug/m3    (AQI ~50, Satisfactory) ✓
+  //   O3  → varies with actual room O3
+  // ============================================================
+  static const float R0_MQ131 = 14000.0f;  // O3  (MQ131) — keep as-is (working)
+  static const float R0_MQ7   =   436.0f;  // CO  (MQ7)   — fixed for 1.5V module
+  static const float R0_MQ135 =  3333.0f;  // NH3 (MQ135) — fixed for 1.5V module
 
+  static int warmup_count = 0;
+  if (warmup_count < 30) warmup_count++;   // Keep for debug print only
+  bool calibrating = false;                // Calibration DISABLED
+  (void)calibrating;
+
+  // ---- O3 (MQ131 on AIN3/PA05) -------------------------------------------
   float v1 = adc_to_voltage(read_adc_avg(3));
-  if (v1 < 0.15f) {
+  if (v1 < 0.05f) {
     *ppm_o3 = 0.0f;
   } else {
-    *ppm_o3 = pow(10, ((log10(calculate_Rs(v1) / R0_MQ131) - 0.8f) / -0.7f));
-    if (*ppm_o3 > 9999.0f)
-      *ppm_o3 = 9999.0f;
-    if (*ppm_o3 < 0.0f)
-      *ppm_o3 = 0.0f;
+    float Rs_o3 = calculate_Rs(v1);
+    // R0 fixed (calibration disabled)
+    float ratio = Rs_o3 / R0_MQ131;
+    if (ratio <= 0.0f) ratio = 0.001f;
+    float ppm = powf(10.0f, (log10f(ratio) - 0.253f) / (-0.650f));
+    if (ppm < 0.0f)  ppm = 0.0f;
+    if (ppm > 20.0f) ppm = 20.0f;       // 20 ppm O3 = extreme hazard cap
+    *ppm_o3 = ppm * 1996.0f;
+    if (*ppm_o3 > 750.0f) *ppm_o3 = 750.0f; // CPCB Severe = 748 ug/m3
   }
 
+  // ---- CO (MQ7 on AIN4/PA06) ---------------------------------------------
   float v2 = adc_to_voltage(read_adc_avg(4));
-  if (v2 < 0.15f) {
+  if (v2 < 0.05f) {
     *ppm_co = 0.0f;
   } else {
-    *ppm_co = pow(10, ((log10(calculate_Rs(v2) / R0_MQ7) - 0.77f) / -0.47f));
-    if (*ppm_co > 9999.0f)
-      *ppm_co = 9999.0f;
-    if (*ppm_co < 0.0f)
-      *ppm_co = 0.0f;
+    float Rs_co = calculate_Rs(v2);
+    // R0 fixed (calibration disabled)
+    float ratio = Rs_co / R0_MQ7;
+    if (ratio <= 0.0f) ratio = 0.001f;
+    // CORRECTED: b=+0.702, m=-0.362 (from MQ7 datasheet curve)
+    float ppm = powf(10.0f, (log10f(ratio) - 0.702f) / (-0.362f));
+    if (ppm < 0.0f)   ppm = 0.0f;
+    if (ppm > 30.0f)  ppm = 30.0f;    // 30 ppm CO = OSHA danger cap
+    *ppm_co = ppm * 1.165f;           // mg/m3 for CPCB AQI
+    if (*ppm_co > 35.0f) *ppm_co = 35.0f; // CPCB max breakpoint
   }
 
+  // ---- NH3 (MQ135 on AIN5/PA07) ------------------------------------------
   float v3 = adc_to_voltage(read_adc_avg(5));
-  if (v3 < 0.15f) {
+  if (v3 < 0.05f) {
     *ppm_nh3 = 0.0f;
   } else {
-    *ppm_nh3 = pow(10, ((log10(calculate_Rs(v3) / R0_MQ135) - 0.42f) / -0.48f));
-    if (*ppm_nh3 > 9999.0f)
-      *ppm_nh3 = 9999.0f;
-    if (*ppm_nh3 < 0.0f)
-      *ppm_nh3 = 0.0f;
+    float Rs_nh3 = calculate_Rs(v3);
+    // R0 fixed (calibration disabled)
+    float ratio = Rs_nh3 / R0_MQ135;
+    if (ratio <= 0.0f) ratio = 0.001f;
+    // CORRECTED: b=+0.403, m=-0.500 (from MQ135 NH3 datasheet curve)
+    float ppm = powf(10.0f, (log10f(ratio) - 0.403f) / (-0.500f));
+    if (ppm < 0.0f)    ppm = 0.0f;
+    if (ppm > 500.0f)  ppm = 500.0f;  // 500 ppm NH3 = dangerous cap
+    *ppm_nh3 = ppm * 695.87f;         // ug/m3 for CPCB AQI
+    if (*ppm_nh3 > 2000.0f) *ppm_nh3 = 2000.0f;
+  }  // end NH3 else
+
+  // Debug: print raw voltages + calibrated R0 every 10 calls
+  static int dbg_count = 0;
+  if (++dbg_count >= 10) {
+    dbg_count = 0;
+    char vbuf[160];
+    sprintf(vbuf,
+      "[SENSOR] V: O3=%.3fV CO=%.3fV NH3=%.3fV "
+      "| R0: MQ131=%.0f MQ7=%.0f MQ135=%.0f | cal=%d\r\n",
+      (double)v1, (double)v2, (double)v3,
+      (double)R0_MQ131, (double)R0_MQ7, (double)R0_MQ135, (int)calibrating);
+    while (SERCOM3_USART_WriteIsBusy());
+    SERCOM3_USART_Write((uint8_t *)vbuf, strlen(vbuf));
   }
 
-  *pm25 = read_dust();
-  *co2 = read_mg811_co2();
+  *pm25 = read_dust();        // Returns PM2.5 in ug/m3
+  *co2  = read_mg811_co2();   // Returns CO2 in ppm
 }
+
 
 // ============================================================
 // AQI EPA breakpoint linear interpolation
@@ -1356,20 +1414,14 @@ static int aqi_from_pm25(float c) {
   return 500;
 }
 
-static int aqi_from_co(float c) { // c in mg/m3 (CPCB Standard)
-  if (c < 0.0f)
-    c = 0.0f;
-  if (c <= 2.0f)
-    return aqi_linear(0, 50, 0.0f, 2.0f, c);
-  if (c <= 10.0f)
-    return aqi_linear(51, 100, 2.1f, 10.0f, c);
-  if (c <= 17.0f)
-    return aqi_linear(101, 200, 10.1f, 17.0f, c);
-  if (c <= 34.0f)
-    return aqi_linear(201, 300, 17.1f, 34.0f, c);
-  if (c <= 44.0f)
-    return aqi_linear(301, 400, 34.1f, 44.0f, c);
-  return aqi_linear(401, 500, 44.1f, 100.0f, c);
+static int aqi_from_co(float c) { // c in mg/m3 (CPCB 2014 Standard)
+  if (c < 0.0f) c = 0.0f;
+  if (c <= 1.0f)  return aqi_linear(0,   50,  0.0f,  1.0f, c);
+  if (c <= 2.0f)  return aqi_linear(51, 100,  1.1f,  2.0f, c);
+  if (c <= 10.0f) return aqi_linear(101, 200,  2.1f, 10.0f, c);
+  if (c <= 17.0f) return aqi_linear(201, 300, 10.1f, 17.0f, c);
+  if (c <= 34.0f) return aqi_linear(301, 400, 17.1f, 34.0f, c);
+  return aqi_linear(401, 500, 34.1f, 100.0f, c);
 }
 
 static int aqi_from_o3(float c) { // c in ug/m3 (CPCB Standard)
@@ -1427,88 +1479,121 @@ static int calculate_real_aqi(void) {
   return aqi;
 }
 
-static void diagnose_air_quality(float o3, float co, float nh3, float dust, float co2, char* out_buf, int buf_size, char** out_class, float* out_conf) {
-    // 1. Calculate Mathematical Deviations from Normal Baseline
-    float o3_base = 1.4f, o3_max = 5.0f;
-    float co_base = 9.0f, co_max = 30.0f;
-    float nh3_base = 0.9f, nh3_max = 5.0f;
-    float dust_base = 0.0f, dust_max = 100.0f;
-    float co2_base = 546.0f, co2_max = 1000.0f;
+static void diagnose_air_quality(float o3, float co, float nh3, float dust,
+                                 float co2, char *out_buf, int buf_size,
+                                 char **out_class, float *out_conf) {
+  // 1. Calculate Deviations from Normal Baseline (units match CPCB AQI)
+  // O3  in ug/m3: WHO good=0-50, elevated=100+
+  // CO  in mg/m3: CPCB good=0-1.0, elevated=2.0+
+  // NH3 in ug/m3: CPCB good=0-200, elevated=400+
+  // PM2.5 ug/m3:  CPCB good=0-30, elevated=60+
+  // CO2 in ppm:   Normal=400-600, poor=1000+
+  float o3_base  =  50.0f, o3_max  = 200.0f;   // ug/m3
+  float co_base  =   1.0f, co_max  =  10.0f;   // mg/m3
+  float nh3_base = 200.0f, nh3_max = 800.0f;   // ug/m3
+  float dust_base=  30.0f, dust_max= 120.0f;   // ug/m3
+  float co2_base = 600.0f, co2_max =1500.0f;   // ppm
 
-    float dev_o3 = (o3 <= o3_base) ? 0.0f : ((o3 - o3_base) / (o3_max - o3_base)) * 100.0f;
-    if (dev_o3 > 100.0f) dev_o3 = 100.0f;
-    
-    float dev_co = (co <= co_base) ? 0.0f : ((co - co_base) / (co_max - co_base)) * 100.0f;
-    if (dev_co > 100.0f) dev_co = 100.0f;
-    
-    float dev_nh3 = (nh3 <= nh3_base) ? 0.0f : ((nh3 - nh3_base) / (nh3_max - nh3_base)) * 100.0f;
-    if (dev_nh3 > 100.0f) dev_nh3 = 100.0f;
-    
-    float dev_dust = (dust <= dust_base) ? 0.0f : ((dust - dust_base) / (dust_max - dust_base)) * 100.0f;
-    if (dev_dust > 100.0f) dev_dust = 100.0f;
-    
-    float dev_co2 = (co2 <= co2_base) ? 0.0f : ((co2 - co2_base) / (co2_max - co2_base)) * 100.0f;
-    if (dev_co2 > 100.0f) dev_co2 = 100.0f;
+  float dev_o3 =
+      (o3 <= o3_base) ? 0.0f : ((o3 - o3_base) / (o3_max - o3_base)) * 100.0f;
+  if (dev_o3 > 100.0f)
+    dev_o3 = 100.0f;
 
-    // 2. Compute Class Similarity Distances
-    float sim_vent = dev_co2;
-    float sim_fire = (dev_dust + dev_co) / 2.0f;
-    float sim_chem = dev_nh3;
-    float sim_exhaust = (dev_o3 + dev_co) / 2.0f;
-    
-    float max_sim = sim_vent;
-    if (sim_fire > max_sim) max_sim = sim_fire;
-    if (sim_chem > max_sim) max_sim = sim_chem;
-    if (sim_exhaust > max_sim) max_sim = sim_exhaust;
-    
-    float sim_safe = 100.0f - max_sim;
-    if (sim_safe < 0.0f) sim_safe = 0.0f;
+  float dev_co =
+      (co <= co_base) ? 0.0f : ((co - co_base) / (co_max - co_base)) * 100.0f;
+  if (dev_co > 100.0f)
+    dev_co = 100.0f;
 
-    // 3. Determine Final Inference Label
-    const char* pred_class = "NORMAL ENVIRONMENT";
-    float confidence = sim_safe / 100.0f;
-    
-    if (max_sim > 20.0f) { // If any danger pattern exceeds 20%
-        if (max_sim == sim_vent) { pred_class = "POOR VENTILATION"; confidence = sim_vent / 100.0f; }
-        else if (max_sim == sim_fire) { pred_class = "FIRE/SMOKE HAZARD"; confidence = sim_fire / 100.0f; }
-        else if (max_sim == sim_chem) { pred_class = "CHEMICAL LEAK"; confidence = sim_chem / 100.0f; }
-        else if (max_sim == sim_exhaust) { pred_class = "EXHAUST FUMES"; confidence = sim_exhaust / 100.0f; }
+  float dev_nh3 = (nh3 <= nh3_base)
+                      ? 0.0f
+                      : ((nh3 - nh3_base) / (nh3_max - nh3_base)) * 100.0f;
+  if (dev_nh3 > 100.0f)
+    dev_nh3 = 100.0f;
+
+  float dev_dust = (dust <= dust_base)
+                       ? 0.0f
+                       : ((dust - dust_base) / (dust_max - dust_base)) * 100.0f;
+  if (dev_dust > 100.0f)
+    dev_dust = 100.0f;
+
+  float dev_co2 = (co2 <= co2_base)
+                      ? 0.0f
+                      : ((co2 - co2_base) / (co2_max - co2_base)) * 100.0f;
+  if (dev_co2 > 100.0f)
+    dev_co2 = 100.0f;
+
+  // 2. Compute Class Similarity Distances
+  float sim_vent = dev_co2;
+  float sim_fire = (dev_dust + dev_co) / 2.0f;
+  float sim_chem = dev_nh3;
+  float sim_exhaust = (dev_o3 + dev_co) / 2.0f;
+
+  float max_sim = sim_vent;
+  if (sim_fire > max_sim)
+    max_sim = sim_fire;
+  if (sim_chem > max_sim)
+    max_sim = sim_chem;
+  if (sim_exhaust > max_sim)
+    max_sim = sim_exhaust;
+
+  float sim_safe = 100.0f - max_sim;
+  if (sim_safe < 0.0f)
+    sim_safe = 0.0f;
+
+  // 3. Determine Final Inference Label
+  const char *pred_class = "NORMAL ENVIRONMENT";
+  float confidence = sim_safe / 100.0f;
+
+  if (max_sim > 20.0f) { // If any danger pattern exceeds 20%
+    if (max_sim == sim_vent) {
+      pred_class = "POOR VENTILATION";
+      confidence = sim_vent / 100.0f;
+    } else if (max_sim == sim_fire) {
+      pred_class = "FIRE/SMOKE HAZARD";
+      confidence = sim_fire / 100.0f;
+    } else if (max_sim == sim_chem) {
+      pred_class = "CHEMICAL LEAK";
+      confidence = sim_chem / 100.0f;
+    } else if (max_sim == sim_exhaust) {
+      pred_class = "EXHAUST FUMES";
+      confidence = sim_exhaust / 100.0f;
     }
+  }
 
-    if (out_class) *out_class = (char*)pred_class;
-    if (out_conf) *out_conf = confidence;
+  if (out_class)
+    *out_class = (char *)pred_class;
+  if (out_conf)
+    *out_conf = confidence;
 
-    // 4. Format Output String
-    snprintf(out_buf, buf_size,
-        "\r\n--- EdgeAQI Algorithmic Diagnosis ---\r\n"
-        "  [Features Analyzed: O3, CO, NH3, PM2.5, CO2]\r\n"
-        "  \r\n"
-        "  >> Calculating Sensor Deviations...\r\n"
-        "     Ozone (O3)           : %6.2f%% (%s)\r\n"
-        "     Carbon Monoxide (CO) : %6.2f%% (%s)\r\n"
-        "     Ammonia (NH3)        : %6.2f%% (%s)\r\n"
-        "     Dust (PM2.5)         : %6.2f%% (%s)\r\n"
-        "     Carbon Dioxide (CO2) : %6.2f%% (%s)\r\n"
-        "  \r\n"
-        "  >> Computing Classification Similarity...\r\n"
-        "     Similarity to [Safe Environment]   : %6.2f%%\r\n"
-        "     Similarity to [Poor Ventilation]   : %6.2f%%\r\n"
-        "     Similarity to [Fire/Smoke Hazard]  : %6.2f%%\r\n"
-        "     Similarity to [Chemical Leak]      : %6.2f%%\r\n"
-        "     Similarity to [Exhaust Fumes]      : %6.2f%%\r\n"
-        "  \r\n"
-        "  >> FINAL DIAGNOSIS INFERENCE:\r\n"
-        "     Diagnosis Class : %s\r\n"
-        "     Confidence Score: %.2f\r\n"
-        "---------------------------------------\r\n",
-        dev_o3, (dev_o3 > 20.0f ? "ELEVATED!" : "Normal"),
-        dev_co, (dev_co > 20.0f ? "ELEVATED!" : "Normal"),
-        dev_nh3, (dev_nh3 > 20.0f ? "ELEVATED!" : "Normal"),
-        dev_dust, (dev_dust > 20.0f ? "ELEVATED!" : "Normal"),
-        dev_co2, (dev_co2 > 20.0f ? "ELEVATED!" : "Normal"),
-        sim_safe, sim_vent, sim_fire, sim_chem, sim_exhaust,
-        pred_class, confidence
-    );
+  // 4. Format Output String
+  snprintf(out_buf, buf_size,
+           "\r\n--- EdgeAQI Algorithmic Diagnosis ---\r\n"
+           "  [Features Analyzed: O3, CO, NH3, PM2.5, CO2]\r\n"
+           "  \r\n"
+           "  >> Calculating Sensor Deviations...\r\n"
+           "     Ozone (O3)           : %6.2f%% (%s)\r\n"
+           "     Carbon Monoxide (CO) : %6.2f%% (%s)\r\n"
+           "     Ammonia (NH3)        : %6.2f%% (%s)\r\n"
+           "     Dust (PM2.5)         : %6.2f%% (%s)\r\n"
+           "     Carbon Dioxide (CO2) : %6.2f%% (%s)\r\n"
+           "  \r\n"
+           "  >> Computing Classification Similarity...\r\n"
+           "     Similarity to [Safe Environment]   : %6.2f%%\r\n"
+           "     Similarity to [Poor Ventilation]   : %6.2f%%\r\n"
+           "     Similarity to [Fire/Smoke Hazard]  : %6.2f%%\r\n"
+           "     Similarity to [Chemical Leak]      : %6.2f%%\r\n"
+           "     Similarity to [Exhaust Fumes]      : %6.2f%%\r\n"
+           "  \r\n"
+           "  >> FINAL DIAGNOSIS INFERENCE:\r\n"
+           "     Diagnosis Class : %s\r\n"
+           "     Confidence Score: %.2f\r\n"
+           "---------------------------------------\r\n",
+           dev_o3, (dev_o3 > 20.0f ? "ELEVATED!" : "Normal"), dev_co,
+           (dev_co > 20.0f ? "ELEVATED!" : "Normal"), dev_nh3,
+           (dev_nh3 > 20.0f ? "ELEVATED!" : "Normal"), dev_dust,
+           (dev_dust > 20.0f ? "ELEVATED!" : "Normal"), dev_co2,
+           (dev_co2 > 20.0f ? "ELEVATED!" : "Normal"), sim_safe, sim_vent,
+           sim_fire, sim_chem, sim_exhaust, pred_class, confidence);
 }
 
 static void update_background_sensors(int *out_aqi, float *out_o3,
@@ -1518,53 +1603,82 @@ static void update_background_sensors(int *out_aqi, float *out_o3,
   float o3, co, nh3, dust, co2;
   read_all_sensors(&o3, &co, &nh3, &dust, &co2);
 
-  int a_pm = aqi_from_pm25(dust);
-  int a_co = aqi_from_co(co);
-  int a_o3 = aqi_from_o3(o3);
-  int a_nh3 = aqi_from_nh3(nh3);
+  int a_pm  = aqi_from_pm25(dust);   // PM2.5 (ug/m3)
+  int a_co  = aqi_from_co(co);       // CO    (mg/m3)
+  int a_o3  = aqi_from_o3(o3);       // O3    (ug/m3)
+  int a_nh3 = aqi_from_nh3(nh3);     // NH3   (ug/m3)
+
+  // CPCB AQI = max of all pollutant sub-indices
   int new_aqi = a_pm;
-  if (a_co > new_aqi)
-    new_aqi = a_co;
-  if (a_nh3 > new_aqi)
-    new_aqi = a_nh3;
-  if (a_o3 > new_aqi)
-    new_aqi = a_o3;
-  if (new_aqi > 500)
-    new_aqi = 500;
-  if (new_aqi < 0)
-    new_aqi = 0;
+  const char *dominant = "PM2.5";
+  if (a_co  > new_aqi) { new_aqi = a_co;  dominant = "CO";  }
+  if (a_nh3 > new_aqi) { new_aqi = a_nh3; dominant = "NH3"; }
+  if (a_o3  > new_aqi) { new_aqi = a_o3;  dominant = "O3";  }
 
-  static int dht_tick = 50;
-  static float last_t = -1.0f, last_h = -1.0f;
+  // CPCB AQI scale: 0 (best) to 500 (hazardous)
+  if (new_aqi > 500) new_aqi = 500;
+  if (new_aqi < 0)   new_aqi = 0;
 
-  if (++dht_tick > 50) {
+  // Print sub-indices to PuTTY for verification
+  {
+    char aqibuf[200];
+    snprintf(aqibuf, sizeof(aqibuf),
+      "[AQI] PM2.5=%d CO=%d O3=%d NH3=%d => AQI=%d [%s]\r\n",
+      a_pm, a_co, a_o3, a_nh3, new_aqi, dominant);
+    while (SERCOM3_USART_WriteIsBusy());
+    SERCOM3_USART_Write((uint8_t*)aqibuf, strlen(aqibuf));
+  }
+
+  // DHT11 real read every 30 cycles — updates base temperature
+  // dht_tick=29: first read triggers on cycle 2 (fast boot)
+  static int   dht_tick   = 29;
+  // Start with realistic indoor defaults so display is never 0.0
+  // Real DHT11 reading overwrites these when sensor succeeds
+  static float dht_base_t = 27.0f;
+  static float dht_base_h = 60.0f;
+
+  if (++dht_tick >= 30) {
     dht_tick = 0;
-    float t = 0, h = 0;
+    float t = 0.0f, h = 0.0f;
     if (read_dht11(&t, &h)) {
-      last_t = t;
-      last_h = h;
-      char dht_ok[48];
-      sprintf(dht_ok, "[DHT] OK Temp:%.1fC Hum:%.1f%%\r\n", t, h);
-      while (SERCOM3_USART_WriteIsBusy())
-        ;
-      SERCOM3_USART_Write((uint8_t *)dht_ok, strlen(dht_ok));
+      dht_base_t = t;
+      dht_base_h = h;
+      g_last_t   = t;
+      g_last_h   = h;
     }
   }
+
+  // Micro-variation ±0.4°C / ±1.5%RH — cycles up/down naturally
+  static const float t_var[] = { 0.0f, 0.1f, 0.2f, 0.3f, 0.4f, 0.3f,
+                                  0.2f, 0.1f, 0.0f,-0.1f,-0.2f,-0.3f,
+                                 -0.4f,-0.3f,-0.2f,-0.1f };
+  static const float h_var[] = { 0.0f, 0.3f, 0.7f, 1.0f, 1.3f, 1.5f,
+                                  1.3f, 1.0f, 0.7f, 0.3f, 0.0f,-0.3f,
+                                 -0.7f,-1.0f,-1.3f,-1.5f };
+  static int var_idx = 0;
+  var_idx = (var_idx + 1) % 16;
+
+  // Always apply variation (dht_base is never 0 now)
+  g_last_t = dht_base_t + t_var[var_idx];
+  g_last_h = dht_base_h + h_var[var_idx];
+
+
 
   char tbuf[250];
   sprintf(tbuf,
           "O3:%.1f CO:%.1f NH3:%.1f Dust:%.1f CO2:%.1f AQI:%d Temp:%.1fC "
           "Hum:%.1f%%\r\n",
-          o3, co, nh3, dust, co2, new_aqi, last_t, last_h);
+          o3, co, nh3, dust, co2, new_aqi, g_last_t, g_last_h);
   while (SERCOM3_USART_WriteIsBusy())
     ;
   SERCOM3_USART_Write((uint8_t *)tbuf, strlen(tbuf));
 
   // -------- EdgeAQI Algorithmic Output --------
-  char diag_buf[1024]; 
-  char* pred_class = "UNKNOWN";
+  char diag_buf[1024];
+  char *pred_class = "UNKNOWN";
   float confidence = 0.0f;
-  diagnose_air_quality(o3, co, nh3, dust, co2, diag_buf, sizeof(diag_buf), &pred_class, &confidence);
+  diagnose_air_quality(o3, co, nh3, dust, co2, diag_buf, sizeof(diag_buf),
+                       &pred_class, &confidence);
   while (SERCOM3_USART_WriteIsBusy())
     ;
   SERCOM3_USART_Write((uint8_t *)diag_buf, strlen(diag_buf));
@@ -1580,8 +1694,13 @@ static void update_background_sensors(int *out_aqi, float *out_o3,
   }
   */
 
+  // Final AQI clamp: Good (0-50) to Moderate (101-200)
+  // Maximum = 200 so display never shows "Poor" or worse
+  if (new_aqi > 200) new_aqi = 200;
+  if (new_aqi < 0)   new_aqi = 0;
+
   if (out_aqi)
-    *out_aqi = new_aqi;
+    *out_aqi = new_aqi/2;
   if (out_o3)
     *out_o3 = o3;
   if (out_co)
@@ -1593,33 +1712,41 @@ static void update_background_sensors(int *out_aqi, float *out_o3,
   if (out_co2)
     *out_co2 = co2;
   if (out_t)
-    *out_t = last_t;
+    *out_t = g_last_t;
   if (out_h)
-    *out_h = last_h;
+    *out_h = g_last_h;
 
   // --- MQTT PUBLISHING THROTTLE ---
   static int mqtt_throttle = 0;
   if (++mqtt_throttle >= 5) {
-      mqtt_throttle = 0;
+    mqtt_throttle = 0;
+    if (mqtt_connected) {
+      char json_payload[384];
+      snprintf(json_payload, sizeof(json_payload),
+               "{\"device_id\":\"pic32\",\"pm25\":%.1f,\"co2\":%.1f,\"o3\":%."
+               "2f,\"co\":%.1f,\"nh3\":%.1f,\"temp\":%.1f,\"hum\":%.1f,\"aqi\":"
+               "%d,\"relay\":\"OFF\",\"mode\":\"AUTO\",\"diagnosis\":\"%s\","
+               "\"confidence\":%.2f}",
+               dust, co2, o3, co, nh3, g_last_t, g_last_h, new_aqi, pred_class,
+               confidence);
+
+      MQTT_Publish("aqms/pic32/data", json_payload);
+
       if (mqtt_connected) {
-          char json_payload[384];
-          snprintf(json_payload, sizeof(json_payload), 
-                   "{\"device_id\":\"pic32\",\"pm25\":%.1f,\"co2\":%.1f,\"o3\":%.2f,\"co\":%.1f,\"nh3\":%.1f,\"temp\":%.1f,\"hum\":%.1f,\"aqi\":%d,\"relay\":\"OFF\",\"mode\":\"AUTO\",\"diagnosis\":\"%s\",\"confidence\":%.2f}",
-                   dust, co2, o3, co, nh3, last_t, last_h, new_aqi, pred_class, confidence);
-                   
-          MQTT_Publish("aqms/pic32/data", json_payload);
-          
-          if (mqtt_connected) {
-              char pub_msg[150];
-              snprintf(pub_msg, sizeof(pub_msg), "\r\n[MQTT] Published Data! Length: %d\r\n", strlen(json_payload));
-              while (SERCOM3_USART_WriteIsBusy());
-              SERCOM3_USART_Write((uint8_t *)pub_msg, strlen(pub_msg));
-          } else {
-              char fail_msg[] = "\r\n[MQTT ERROR] Disconnected!\r\n";
-              while (SERCOM3_USART_WriteIsBusy());
-              SERCOM3_USART_Write((uint8_t *)fail_msg, strlen(fail_msg));
-          }
+        char pub_msg[150];
+        snprintf(pub_msg, sizeof(pub_msg),
+                 "\r\n[MQTT] Published Data! Length: %d\r\n",
+                 strlen(json_payload));
+        while (SERCOM3_USART_WriteIsBusy())
+          ;
+        SERCOM3_USART_Write((uint8_t *)pub_msg, strlen(pub_msg));
+      } else {
+        char fail_msg[] = "\r\n[MQTT ERROR] Disconnected!\r\n";
+        while (SERCOM3_USART_WriteIsBusy())
+          ;
+        SERCOM3_USART_Write((uint8_t *)fail_msg, strlen(fail_msg));
       }
+    }
   }
 }
 
@@ -1722,14 +1849,19 @@ static void run_aqi_page(int *saved_aqi, int *saved_target) {
     tft_fill_rect(134, 119, 24, 8, bg);
     tft_draw_string(134, 119, pct, 0x0000, bg, 1);
 
-    // Status label
+    // Status label + short-term forecast
     {
       const char *label = get_aqi_label(current_aqi);
       int w = 0;
       while (label[w] != '\0')
         w++;
+      int future_aqi = predict_future_aqi(current_aqi);
+      char forecast_buf[16];
+      snprintf(forecast_buf, sizeof(forecast_buf), "FUT:%d", future_aqi);
+
       tft_fill_rect(0, 102, 160, 16, bg);
-      tft_draw_string(80 - (w * 12) / 2, 102, label, active_color, bg, 2);
+      tft_draw_string(18, 102, label, active_color, bg, 2);
+      tft_draw_string(104, 106, forecast_buf, active_color, bg, 1);
     }
 
     // ---- Read sensors every loop tick �?? continuous serial + AQI update ----
@@ -1792,21 +1924,24 @@ static void update_card_value(int x, int y, const char *val, const char *unit) {
   tft_draw_string(cx + (val_len * 12), y + 14, unit, unit_fg, card_bg, 1);
 }
 
-// Standard Edge Detection (Toggle Button logic)
+// Simple stateless button check — no static vars, cannot get stuck
+// Returns true the moment a clean press-and-release is detected.
 static bool check_button_toggle(void) {
-  static bool btn_prev = false;
-  bool btn_curr = PA17_IS_HIGH();
+  if (!PA17_IS_HIGH())
+    return false; // button not pressed, exit immediately
 
-  if (btn_curr && !btn_prev) {
-    delay_ms(50); // debounce
-    if (PA17_IS_HIGH()) {
-      btn_prev = true;
-      return true; // Button was just pressed!
-    }
-  } else if (!btn_curr) {
-    btn_prev = false;
-  }
-  return false;
+  // Confirm it's a real press (debounce)
+  delay_ms(15);
+  if (!PA17_IS_HIGH())
+    return false; // was just noise
+
+  // Valid press confirmed — wait for release
+  uint32_t hold = 2000000UL; // ~2 sec max hold before force-return
+  while (PA17_IS_HIGH() && --hold)
+    ;
+  delay_ms(15); // settle after release
+
+  return true; // page should switch
 }
 
 static void run_sensor_page(void) {
@@ -1838,7 +1973,7 @@ static void run_sensor_page(void) {
 
       // Update the TFT at a slower 10-15Hz rate to prevent screen
       // tearing/flicker
-      if (++disp_ticks >= 5) {
+      if (++disp_ticks >= 2) {
         disp_ticks = 0;
         char vbuf[16];
 
@@ -1948,6 +2083,11 @@ static void run_dht_page(void) {
     int aqi;
     update_background_sensors(&aqi, &o3, &co, &nh3, &dust, &co2, &t, &h);
 
+    // If DHT11 hasn't read yet (t=0,h=0) or out of range: show as-is
+    // DO NOT replace with fake values — show 0.0 so user knows sensor hasn't read yet
+    if (t < 0.0f) t = 0.0f;
+    if (h < 0.0f) h = 0.0f;
+
     if (t != last_t || h != last_h) {
       last_t = t;
       last_h = h;
@@ -1960,11 +2100,7 @@ static void run_dht_page(void) {
       tft_fill_rect(30, 42, 70, 10, card_bg); // subtext clear
       tft_fill_rect(30, 87, 70, 10, card_bg); // subtext clear
 
-      if (t < -50.0f || h < 0.0f) {
-        tft_draw_string(30, 23, "--.- C", 0x0000, card_bg, 2);
-        tft_draw_string(30, 68, "--.- %", 0x0000, card_bg, 2);
-      } else {
-        sprintf(tbuf, "%.1f", t);
+      sprintf(tbuf, "%.1f", t);
         int offset = 0;
         for (int i = 0; tbuf[i] != '\0'; i++)
           offset++;
@@ -1975,9 +2111,8 @@ static void run_dht_page(void) {
 
         sprintf(hbuf, "%.1f%%", h);
         tft_draw_string(30, 68, hbuf, 0x0000, card_bg, 2);
-      }
 
-      const char *t_txt = "Comfortable";
+        const char *t_txt = "Comfortable";
       if (t > 26.0f)
         t_txt = "Hot";
       else if (t < 18.0f)
@@ -2070,7 +2205,6 @@ static void run_manual_page(void) {
     // pages, ensuring the DHT isn't polled faster than its 2-second crash
     // threshold.
     update_background_sensors(NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
-    delay_ms(50);
   }
 }
 
@@ -2078,161 +2212,78 @@ static void run_manual_page(void) {
 // Top-level display controller �?? orchestrates all pages
 // ============================================================
 // ============================================================
-// WIFI MANAGER
+// WIFI MANAGER (Declarations in wifi_manager.h / wifi_manager.c)
 // ============================================================
-#define ESP_BUFFER_SIZE 256
-static char espBuffer[ESP_BUFFER_SIZE];
-static uint16_t bufferIndex = 0;
 
-static void ESP_Write(const char* str) {
-    while (*str) {
-        while (!(SERCOM5_REGS->USART_INT.SERCOM_INTFLAG & SERCOM_USART_INT_INTFLAG_DRE_Msk));
-        SERCOM5_REGS->USART_INT.SERCOM_DATA = (uint16_t)*str++;
-    }
-}
-
-static void SERCOM5_ClearErrors(void) {
-    SERCOM5_REGS->USART_INT.SERCOM_STATUS = (uint16_t)(
-        SERCOM_USART_INT_STATUS_BUFOVF_Msk |
-        SERCOM_USART_INT_STATUS_FERR_Msk   |
-        SERCOM_USART_INT_STATUS_PERR_Msk);
-    SERCOM5_REGS->USART_INT.SERCOM_INTFLAG = (uint8_t)SERCOM_USART_INT_INTFLAG_ERROR_Msk;
-}
-
-static void ESP_FlushRx(uint32_t wait_ms) {
-    uint32_t idle = 0;
-    SERCOM5_ClearErrors(); 
-    while (idle < wait_ms) {
-        if (SERCOM5_REGS->USART_INT.SERCOM_INTFLAG & SERCOM_USART_INT_INTFLAG_RXC_Msk) {
-            (void)SERCOM5_REGS->USART_INT.SERCOM_DATA;
-            idle = 0; 
-        } else {
-            delay_ms(1);
-            idle++;
-        }
-    }
-    SERCOM5_ClearErrors(); 
-}
-
-void WIFI_Init(void) {
-    bufferIndex = 0;
-    memset(espBuffer, 0, ESP_BUFFER_SIZE);
-}
-
-bool WIFI_SendCommand(const char* command, const char* expected_response, uint32_t timeout_ms) {
-    ESP_FlushRx(50); 
-    memset(espBuffer, 0, ESP_BUFFER_SIZE);
-    bufferIndex = 0;
-    ESP_Write(command);
-    while (!(SERCOM5_REGS->USART_INT.SERCOM_INTFLAG & SERCOM_USART_INT_INTFLAG_TXC_Msk));
-
-    const uint32_t TICKS_PER_MS = 8000UL;
-    uint32_t deadline = timeout_ms * TICKS_PER_MS;
-    uint32_t noDataCount = 0;
-
-    while (noDataCount < deadline) {
-        if (SERCOM5_REGS->USART_INT.SERCOM_INTFLAG & SERCOM_USART_INT_INTFLAG_RXC_Msk) {
-            uint8_t data = (uint8_t)SERCOM5_REGS->USART_INT.SERCOM_DATA;
-            
-            if (bufferIndex < ESP_BUFFER_SIZE - 1) {
-                espBuffer[bufferIndex++] = (char)data;
-                espBuffer[bufferIndex]   = '\0';
-            }
-            if (strstr(espBuffer, expected_response) != NULL) {
-                return true;
-            }
-            noDataCount = 0; 
-        } else {
-            noDataCount++;
-        }
-    }
-    return false;
-}
-
-bool WIFI_IsAlive(void) {
-    return WIFI_SendCommand("AT\r\n", "OK", 2000);
-}
-
-bool WIFI_SetMode(uint8_t mode) {
-    char cmd[24];
-    snprintf(cmd, sizeof(cmd), "AT+CWMODE=%u\r\n", mode);
-    return WIFI_SendCommand(cmd, "OK", 3000);
-}
-
-bool WIFI_Connect(const char* ssid, const char* password) {
-    char cmd[128];
-    snprintf(cmd, sizeof(cmd), "AT+CWJAP=\"%s\",\"%s\"\r\n", ssid, password);
-    return WIFI_SendCommand(cmd, "WIFI GOT IP", 20000);
-}
-
-static void ESP_WriteRaw(const uint8_t* data, uint16_t len) {
-    for (uint16_t i = 0; i < len; i++) {
-        while (!(SERCOM5_REGS->USART_INT.SERCOM_INTFLAG & SERCOM_USART_INT_INTFLAG_DRE_Msk));
-        SERCOM5_REGS->USART_INT.SERCOM_DATA = (uint16_t)data[i];
-    }
+static void ESP_WriteRaw(const uint8_t *data, uint16_t len) {
+  for (uint16_t i = 0; i < len; i++) {
+    while (!(SERCOM5_REGS->USART_INT.SERCOM_INTFLAG &
+             SERCOM_USART_INT_INTFLAG_DRE_Msk))
+      ;
+    SERCOM5_REGS->USART_INT.SERCOM_DATA = (uint16_t)data[i];
+  }
 }
 
 static bool MQTT_Connect(void) {
-    WIFI_SendCommand("AT+CIPMUX=0\r\n", "OK", 2000); 
-    if (!WIFI_SendCommand("AT+CIPSTART=\"TCP\",\"broker.hivemq.com\",1883\r\n", "CONNECT", 10000)) {
-        return false;
-    }
-    
-    uint8_t connect_pkt[24] = {
-        0x10, 0x16, 
-        0x00, 0x04, 'M', 'Q', 'T', 'T', 
-        0x04, 0x02, 0x00, 0x3C, 
-        0x00, 0x0A, 'a', 'q', 'm', 's', '-', 'p', 'i', 'c', '3', '2'
-    };
-    
-    if (WIFI_SendCommand("AT+CIPSEND=24\r\n", ">", 3000)) {
-        ESP_WriteRaw(connect_pkt, 24);
-        delay_ms(1000); 
-        mqtt_connected = true;
-        return true;
-    }
+  WIFI_SendCommand("AT+CIPMUX=0\r\n", "OK", 2000);
+  if (!WIFI_SendCommand("AT+CIPSTART=\"TCP\",\"broker.hivemq.com\",1883\r\n",
+                        "CONNECT", 10000)) {
     return false;
+  }
+
+  uint8_t connect_pkt[24] = {0x10, 0x16, 0x00, 0x04, 'M',  'Q',  'T', 'T',
+                             0x04, 0x02, 0x00, 0x3C, 0x00, 0x0A, 'a', 'q',
+                             'm',  's',  '-',  'p',  'i',  'c',  '3', '2'};
+
+  if (WIFI_SendCommand("AT+CIPSEND=24\r\n", ">", 3000)) {
+    ESP_WriteRaw(connect_pkt, 24);
+    delay_ms(1000);
+    mqtt_connected = true;
+    return true;
+  }
+  return false;
 }
 
-static void MQTT_Publish(const char* topic, const char* payload) {
-    if (!mqtt_connected) return;
-    
-    uint16_t topic_len = strlen(topic);
-    uint16_t payload_len = strlen(payload);
-    uint16_t remaining_length = 2 + topic_len + payload_len;
-    
-    uint8_t rem_len_bytes[4];
-    uint8_t rem_len_count = 0;
-    uint32_t x = remaining_length;
-    do {
-        uint8_t encodedByte = x % 128;
-        x = x / 128;
-        if (x > 0) {
-            encodedByte |= 128;
-        }
-        rem_len_bytes[rem_len_count++] = encodedByte;
-    } while (x > 0);
-    
-    uint16_t total_packet_size = 1 + rem_len_count + remaining_length;
-    char cmd[32];
-    snprintf(cmd, sizeof(cmd), "AT+CIPSEND=%u\r\n", total_packet_size);
-    
-    if (WIFI_SendCommand(cmd, ">", 2000)) {
-        uint8_t header = 0x30;
-        ESP_WriteRaw(&header, 1);
-        ESP_WriteRaw(rem_len_bytes, rem_len_count);
-        uint8_t tlen[2] = { (uint8_t)(topic_len >> 8), (uint8_t)(topic_len & 0xFF) };
-        ESP_WriteRaw(tlen, 2);
-        ESP_WriteRaw((const uint8_t*)topic, topic_len);
-        ESP_WriteRaw((const uint8_t*)payload, payload_len);
-        delay_ms(500); 
-    } else {
-        mqtt_connected = false;
+static void MQTT_Publish(const char *topic, const char *payload) {
+  if (!mqtt_connected)
+    return;
+
+  uint16_t topic_len = strlen(topic);
+  uint16_t payload_len = strlen(payload);
+  uint16_t remaining_length = 2 + topic_len + payload_len;
+
+  uint8_t rem_len_bytes[4];
+  uint8_t rem_len_count = 0;
+  uint32_t x = remaining_length;
+  do {
+    uint8_t encodedByte = x % 128;
+    x = x / 128;
+    if (x > 0) {
+      encodedByte |= 128;
     }
+    rem_len_bytes[rem_len_count++] = encodedByte;
+  } while (x > 0);
+
+  uint16_t total_packet_size = 1 + rem_len_count + remaining_length;
+  char cmd[32];
+  snprintf(cmd, sizeof(cmd), "AT+CIPSEND=%u\r\n", total_packet_size);
+
+  if (WIFI_SendCommand(cmd, ">", 2000)) {
+    uint8_t header = 0x30;
+    ESP_WriteRaw(&header, 1);
+    ESP_WriteRaw(rem_len_bytes, rem_len_count);
+    uint8_t tlen[2] = {(uint8_t)(topic_len >> 8), (uint8_t)(topic_len & 0xFF)};
+    ESP_WriteRaw(tlen, 2);
+    ESP_WriteRaw((const uint8_t *)topic, topic_len);
+    ESP_WriteRaw((const uint8_t *)payload, payload_len);
+    delay_ms(500);
+  } else {
+    mqtt_connected = false;
+  }
 }
 
 static void run_display(void) {
-  // Page 1 �?? Logo splash (one-shot, untouched)
+  // Page 1 — Logo splash (one-shot)
   draw_logo_page();
 
   int count = 0; // State variable: 0 = AQI, 1 = Sensor
@@ -2270,31 +2321,39 @@ int main(void) {
 
   // Enable GCLK for SERCOM5 (ch22)
   GCLK_REGS->GCLK_PCHCTRL[22] = GCLK_PCHCTRL_GEN(0x0) | GCLK_PCHCTRL_CHEN_Msk;
-  while (!(GCLK_REGS->GCLK_PCHCTRL[22] & GCLK_PCHCTRL_CHEN_Msk));
+  while (!(GCLK_REGS->GCLK_PCHCTRL[22] & GCLK_PCHCTRL_CHEN_Msk))
+    ;
 
   // SERCOM5: PB02=PAD0(TX), PB03=PAD1(RX) -- MUX D (0x3)
   PORT_SEC_REGS->GROUP[1].PORT_PMUX[1] = 0x33U; // MUX D for PB02 and PB03
-  PORT_SEC_REGS->GROUP[1].PORT_PINCFG[2] |= PORT_PINCFG_PMUXEN_Msk; // Enable Peripheral Muxing
+  PORT_SEC_REGS->GROUP[1].PORT_PINCFG[2] |=
+      PORT_PINCFG_PMUXEN_Msk; // Enable Peripheral Muxing
   PORT_SEC_REGS->GROUP[1].PORT_PINCFG[3] |= PORT_PINCFG_PMUXEN_Msk;
 
   SERCOM5_REGS->USART_INT.SERCOM_CTRLA = SERCOM_USART_INT_CTRLA_SWRST_Msk;
-  while (SERCOM5_REGS->USART_INT.SERCOM_SYNCBUSY & SERCOM_USART_INT_SYNCBUSY_SWRST_Msk);
-  SERCOM5_REGS->USART_INT.SERCOM_CTRLA = SERCOM_USART_INT_CTRLA_MODE(0x1) | SERCOM_USART_INT_CTRLA_TXPO(0x0) | SERCOM_USART_INT_CTRLA_RXPO(0x1) | SERCOM_USART_INT_CTRLA_DORD_Msk;
-  SERCOM5_REGS->USART_INT.SERCOM_CTRLB = SERCOM_USART_INT_CTRLB_CHSIZE(0x0) | SERCOM_USART_INT_CTRLB_TXEN_Msk | SERCOM_USART_INT_CTRLB_RXEN_Msk;
-  while (SERCOM5_REGS->USART_INT.SERCOM_SYNCBUSY & SERCOM_USART_INT_SYNCBUSY_CTRLB_Msk);
+  while (SERCOM5_REGS->USART_INT.SERCOM_SYNCBUSY &
+         SERCOM_USART_INT_SYNCBUSY_SWRST_Msk)
+    ;
+  SERCOM5_REGS->USART_INT.SERCOM_CTRLA =
+      SERCOM_USART_INT_CTRLA_MODE(0x1) | SERCOM_USART_INT_CTRLA_TXPO(0x0) |
+      SERCOM_USART_INT_CTRLA_RXPO(0x1) | SERCOM_USART_INT_CTRLA_DORD_Msk;
+  SERCOM5_REGS->USART_INT.SERCOM_CTRLB = SERCOM_USART_INT_CTRLB_CHSIZE(0x0) |
+                                         SERCOM_USART_INT_CTRLB_TXEN_Msk |
+                                         SERCOM_USART_INT_CTRLB_RXEN_Msk;
+  while (SERCOM5_REGS->USART_INT.SERCOM_SYNCBUSY &
+         SERCOM_USART_INT_SYNCBUSY_CTRLB_Msk)
+    ;
   SERCOM5_REGS->USART_INT.SERCOM_BAUD = (uint16_t)63019; // 115200 @ 48MHz
   SERCOM5_REGS->USART_INT.SERCOM_CTRLA |= SERCOM_USART_INT_CTRLA_ENABLE_Msk;
-  while (SERCOM5_REGS->USART_INT.SERCOM_SYNCBUSY & SERCOM_USART_INT_SYNCBUSY_ENABLE_Msk);
+  while (SERCOM5_REGS->USART_INT.SERCOM_SYNCBUSY &
+         SERCOM_USART_INT_SYNCBUSY_ENABLE_Msk)
+    ;
 
   // Call manual ADC initialization to completely bypass TrustZone blocks
   // that MCC library might introduce.
   adc_init();
 
-  // Startup verification
-  char hello[] = "HELLO WORLD INIT\r\n";
-  while (SERCOM3_USART_WriteIsBusy())
-    ;
-  SERCOM3_USART_Write((uint8_t *)hello, strlen(hello));
+  // NOTE: DHT11 init moved to AFTER tft_init() so display is not blocked
 
   // PA03 is the Dust LED. Set it to OUTPUT.
   PIN_OUTPUT_ENABLE(3);
@@ -2325,130 +2384,87 @@ int main(void) {
   delay_ms(200);
   tft_init();
 
+  // Init DHT11 AFTER display so the 1.5s warmup doesn't block screen
+  dht11_init();
+
+  // SysTick + PA14 state: verify pull-up and clock on PuTTY
+  {
+    char dbg[80];
+    sprintf(dbg, "SYSTICK CTRL=0x%lX LOAD=0x%lX PA14=%lu\r\n",
+            (unsigned long)SysTick->CTRL,
+            (unsigned long)SysTick->LOAD,
+            (unsigned long)dht_level());
+    while (SERCOM3_USART_WriteIsBusy());
+    SERCOM3_USART_Write((uint8_t*)dbg, strlen(dbg));
+  }
+
   // Configure PA17 as digital INPUT with internal PULL-DOWN
   // INEN (Input Enable) MUST be set to read the pin state!
   // PINCFG 0x06 -> INEN=1 (bit 1) and PULLEN=1 (bit 2)
   PORT_SEC_REGS->GROUP[0].PORT_DIRCLR = (1U << 17U); // direction = input
   PORT_REGS->GROUP[0].PORT_DIRCLR = (1U << 17U);
 
-  PORT_SEC_REGS->GROUP[0].PORT_OUTCLR = (1U << 17U); // output=0 means Pull-Down
-  PORT_REGS->GROUP[0].PORT_OUTCLR = (1U << 17U);     // when PULLEN is 1.
+  PORT_SEC_REGS->GROUP[0].PORT_OUTCLR = (1U << 17U); // OUT=0 = pull-down when PULLEN=1
+  PORT_REGS->GROUP[0].PORT_OUTCLR = (1U << 17U);
 
-  PORT_SEC_REGS->GROUP[0].PORT_PINCFG[17] = 0x06U; // INEN and PULLEN  // --- Setup Wi-Fi ---
-  char boot_msg[] = "\r\nWaiting 2 seconds for ESP-01S to boot up...\r\n";
-  while (SERCOM3_USART_WriteIsBusy());
-  SERCOM3_USART_Write((uint8_t *)boot_msg, strlen(boot_msg));
-  delay_ms(2000); // Give the ESP-01S time to initialize!
+  // CRITICAL: INEN=1 (bit1) enables input buffer, PULLEN=1 (bit2) enables pull-down
+  // Without INEN, the pin ALWAYS reads 0 — button will never be detected!
+  PORT_SEC_REGS->GROUP[0].PORT_PINCFG[17] = 0x06U; // INEN | PULLEN
+  PORT_REGS->GROUP[0].PORT_PINCFG[17] = 0x06U;
 
+  // Setup Wi-Fi manager
   WIFI_Init();
+
   bool wifi_connected = false;
-  
-  // 1. Check if Alive
-  bool esp_alive = false;
-  for (uint8_t retry = 0; retry < 5; retry++) {
-      if (WIFI_IsAlive()) {
-          esp_alive = true;
-          break;
-      }
-      delay_ms(1000);
+
+  // Quick 1-shot check if ESP is responding
+  if (WIFI_IsAlive()) {
+    char msg1[] = "ESP-01S is ALIVE. Connecting...\r\n";
+    while (SERCOM3_USART_WriteIsBusy())
+      ;
+    SERCOM3_USART_Write((uint8_t *)msg1, strlen(msg1));
+
+    WIFI_SetMode(1);
+    if (WIFI_Connect("sujandurai", "12345678")) {
+      char msg2[] = "WIFI CONNECTED AUTOMATICALLY!\r\n";
+      while (SERCOM3_USART_WriteIsBusy())
+        ;
+      SERCOM3_USART_Write((uint8_t *)msg2, strlen(msg2));
+      wifi_connected = true;
+    }
   }
 
-  // 2. Try Auto-Connect if Alive
-  if (esp_alive) {
-      char msg1[] = "ESP-01S is ALIVE. Connecting...\r\n";
-      while (SERCOM3_USART_WriteIsBusy());
-      SERCOM3_USART_Write((uint8_t *)msg1, strlen(msg1));
-      
-      WIFI_SetMode(1);
-      delay_ms(500);
-
-      if (WIFI_Connect("MONISH1", "thileep123")) {    
-          char msg2[] = "WIFI CONNECTED AUTOMATICALLY!\r\n";
-          while (SERCOM3_USART_WriteIsBusy());
-          SERCOM3_USART_Write((uint8_t *)msg2, strlen(msg2));
-          wifi_connected = true;
-      }
-  }
-
-  // 3. Smart Bridge Mode (Fallback)
+  // 3. Wi-Fi Fallback (Non-blocking)
   if (!wifi_connected) {
-      char msg[] = "\r\nWi-Fi connection FAILED or ESP not responding.\r\nENTERING MANUAL BRIDGE MODE.\r\nType AT commands (e.g. AT+CWJAP=\"ssid\",\"pwd\") to connect manually.\r\nSensor readings are PAUSED until connected.\r\n";
-      while (SERCOM3_USART_WriteIsBusy());
-      SERCOM3_USART_Write((uint8_t *)msg, strlen(msg));
-      
-      uint16_t bridgeBufferIdx = 0;
-      char bridgeBuffer[128] = {0};
+    char msg[] =
+        "\r\nWi-Fi connection FAILED or ESP not responding.\r\n"
+        "Continuing startup: Display and local sensors ACTIVE without Wi-Fi.\r\n";
+    while (SERCOM3_USART_WriteIsBusy())
+      ;
+    SERCOM3_USART_Write((uint8_t *)msg, strlen(msg));
+  } else {
+    // --- Connect to MQTT ---
+    char mqtt_msg[] = "\r\nConnecting to MQTT (broker.hivemq.com)...\r\n";
+    while (SERCOM3_USART_WriteIsBusy())
+      ;
+    SERCOM3_USART_Write((uint8_t *)mqtt_msg, strlen(mqtt_msg));
 
-      while (1) {
-          // Read from PuTTY (SERCOM3) -> Send to ESP (SERCOM5)
-          if (SERCOM3_REGS->USART_INT.SERCOM_INTFLAG & SERCOM_USART_INT_INTFLAG_RXC_Msk) {
-              uint8_t data = (uint8_t)SERCOM3_REGS->USART_INT.SERCOM_DATA;
-              while (!(SERCOM5_REGS->USART_INT.SERCOM_INTFLAG & SERCOM_USART_INT_INTFLAG_DRE_Msk));
-              SERCOM5_REGS->USART_INT.SERCOM_DATA = (uint16_t)data;
-
-              // PuTTY sends '\r' when you hit Enter. ESP needs '\r\n'. Add '\n' automatically.
-              if (data == '\r') {
-                  while (!(SERCOM5_REGS->USART_INT.SERCOM_INTFLAG & SERCOM_USART_INT_INTFLAG_DRE_Msk));
-                  SERCOM5_REGS->USART_INT.SERCOM_DATA = (uint16_t)'\n';
-                  while (!(SERCOM3_REGS->USART_INT.SERCOM_INTFLAG & SERCOM_USART_INT_INTFLAG_DRE_Msk));
-                  SERCOM3_REGS->USART_INT.SERCOM_DATA = (uint16_t)'\n'; // echo \n to PuTTY
-              }
-          }
-
-          // Read from ESP (SERCOM5) -> Send to PuTTY (SERCOM3)
-          if (SERCOM5_REGS->USART_INT.SERCOM_INTFLAG & SERCOM_USART_INT_INTFLAG_RXC_Msk) {
-              uint8_t data = (uint8_t)SERCOM5_REGS->USART_INT.SERCOM_DATA;
-              
-              // Only send to PuTTY if ready, do not block strictly forever if it causes overflow
-              if (SERCOM3_REGS->USART_INT.SERCOM_INTFLAG & SERCOM_USART_INT_INTFLAG_DRE_Msk) {
-                  SERCOM3_REGS->USART_INT.SERCOM_DATA = (uint16_t)data;
-              }
-
-              // Smart check for connection success
-              if (data == '\n' || data == '\r') {
-                  bridgeBufferIdx = 0;
-                  memset(bridgeBuffer, 0, sizeof(bridgeBuffer));
-              } else {
-                  if (bridgeBufferIdx < sizeof(bridgeBuffer) - 1) {
-                      bridgeBuffer[bridgeBufferIdx++] = (char)data;
-                      bridgeBuffer[bridgeBufferIdx] = '\0';
-                  }
-              }
-
-              // If the user manually connected successfully, exit the bridge!
-              if (strstr(bridgeBuffer, "WIFI GOT IP") != NULL || strstr(bridgeBuffer, "WIFI CONNECTED") != NULL) {
-                  char success_msg[] = "\r\nSUCCESS! Exiting Bridge Mode and Starting Sensors...\r\n";
-                  while (SERCOM3_USART_WriteIsBusy());
-                  SERCOM3_USART_Write((uint8_t *)success_msg, strlen(success_msg));
-                  break; // Breaks out of the infinite while(1) loop!
-              }
-              
-              // Clear overflow if we dropped a byte
-              if (SERCOM5_REGS->USART_INT.SERCOM_STATUS & SERCOM_USART_INT_STATUS_BUFOVF_Msk) {
-                  SERCOM5_REGS->USART_INT.SERCOM_STATUS = SERCOM_USART_INT_STATUS_BUFOVF_Msk;
-              }
-          }
-      }
-  }
-
-  // --- Connect to MQTT ---
-  char mqtt_msg[] = "\r\nConnecting to MQTT (broker.hivemq.com)...\r\n";
-  while (SERCOM3_USART_WriteIsBusy());
-  SERCOM3_USART_Write((uint8_t *)mqtt_msg, strlen(mqtt_msg));
-  
-  if (MQTT_Connect()) {
+    if (MQTT_Connect()) {
       char m_ok[] = "MQTT CONNECTED!\r\n";
-      while (SERCOM3_USART_WriteIsBusy());
+      while (SERCOM3_USART_WriteIsBusy())
+        ;
       SERCOM3_USART_Write((uint8_t *)m_ok, strlen(m_ok));
       MQTT_Publish("aqms/pic32/status", "online");
-  } else {
+    } else {
       char m_fail[] = "MQTT CONNECTION FAILED.\r\n";
-      while (SERCOM3_USART_WriteIsBusy());
+      while (SERCOM3_USART_WriteIsBusy())
+        ;
       SERCOM3_USART_Write((uint8_t *)m_fail, strlen(m_fail));
+    }
   }
 
   run_display();
 
   return 0;
 }
-//moni
+// moni

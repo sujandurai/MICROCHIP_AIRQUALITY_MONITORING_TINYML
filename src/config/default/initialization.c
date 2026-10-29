@@ -199,6 +199,13 @@ void SYS_Initialize ( void* data )
   
     PORT_Initialize();
 
+    /* PA14 = DHT11 data pin: drive HIGH from startup so sensor sees idle bus.
+     * PORT_Initialize() only configures PA10/11/12; PA14 stays floating by
+     * default which prevents the DHT11 from starting its power-on sequence. */
+    PORT_SEC_REGS->GROUP[0].PORT_PINCFG[14] = 0x00U;   /* GPIO, no peripheral */
+    PORT_SEC_REGS->GROUP[0].PORT_OUTSET     = (1U << 14U); /* HIGH = idle */
+    PORT_SEC_REGS->GROUP[0].PORT_DIRSET     = (1U << 14U); /* output */
+
     CLOCK_Initialize();
 
 

@@ -32,3 +32,13 @@ desktop.ini
 .vscode/
 *.suo
 *.user
+
+nbproject/
+Makefile*
+Package-*
+private/
+_build/
+!cmake/**/user.cmake
+cmake/**/.generated/*
+cmake/**/CMake*
+out/

@@ -3,7 +3,12 @@
     <editor-bookmarks xmlns="http://www.netbeans.org/ns/editor-bookmarks/2" lastBookmarkId="0"/>
     <open-files xmlns="http://www.netbeans.org/ns/projectui-open-files/2">
         <group>
-            <file>file:/C:/Users/monis/mplabnew_secure/src/main.c</file>
+            <file>file:/C:/FullyCompleted/src/tinyml/edge-impulse-sdk/tensorflow/lite/micro/kernels/activations.cpp</file>
+            <file>file:/C:/FullyCompleted/src/tinyml/edge-impulse-sdk/tensorflow/lite/micro/all_ops_resolver.cpp</file>
+            <file>file:/C:/FullyCompleted/tftdisplay_secure.X/Makefile</file>
+            <file>file:/C:/FullyCompleted/src/main.c</file>
+            <file>file:/C:/FullyCompleted/src/tinyml/edge-impulse-sdk/tensorflow/lite/micro/kernels/activations_common.cpp</file>
+            <file>file:/C:/FullyCompleted/src/tinyml/edge-impulse-sdk/tensorflow/lite/micro/kernels/call_once.cpp</file>
         </group>
     </open-files>
 </project-private>
